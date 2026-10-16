@@ -1,7 +1,18 @@
 const http = require('node:http');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, randomBytes, scrypt, timingSafeEqual } = require('node:crypto');
+const { promisify } = require('node:util');
+const derive = promisify(scrypt);
+const masterSalt = 'class-showcase-master-v1';
+const masterHash = Buffer.from('98acef02607d6a431e3d325e494a139262bf952664759e2e151180304439644b', 'hex');
+const attempts = new Map();
+async function passwordHash(password, salt) { return (await derive(password, salt, 32)).toString('hex'); }
+async function matches(password, salt, hash) {
+  if (typeof salt !== 'string' || typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash)) return false;
+  return timingSafeEqual(await derive(password, salt, 32), Buffer.from(hash, 'hex'));
+}
+function publicProject(item) { const { deleteAuth, ...visible } = item; return visible; }
 const root = __dirname;
 const data = process.env.DATA_DIR || path.join(root, 'data');
 const cloudURL = process.env.SUPABASE_URL?.replace(/\/$/, '');
@@ -45,7 +56,7 @@ const server = http.createServer(async (req, res) => {
   const json = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
   try {
     if (req.method === 'GET' && url.pathname === '/api/config') return json(200, { persistent: cloud });
-    if (req.method === 'GET' && url.pathname === '/api/projects') return json(200, await projects());
+    if (req.method === 'GET' && url.pathname === '/api/projects') return json(200, (await projects()).map(publicProject));
     if (req.method === 'POST' && url.pathname === '/api/projects') {
       let size = 0; const chunks = [];
       for await (const chunk of req) { size += chunk.length; if (size > 15 * 1024 * 1024) return json(413, { error: '기획서는 10MB 이하로 올려주세요.' }); chunks.push(chunk); }
@@ -55,6 +66,7 @@ const server = http.createServer(async (req, res) => {
         if (typeof p[key] !== 'string' || !p[key].trim() || p[key].length > max) return json(400, { error: '작품명, 제작자, 소개를 길이에 맞게 입력해주세요.' });
       }
       if (!['생활·편의', '학습·교육', '문화·취미', '사회·환경'].includes(p.category)) return json(400, { error: '분야를 선택해주세요.' });
+      if (typeof p.password !== 'string' || !/^\d{4}$/.test(p.password)) return json(400, { error: '삭제 암호는 숫자 4자리로 입력해주세요.' });
       let appURL;
       try {
         if (typeof p.url !== 'string' || p.url.length > 2048) throw Error();
@@ -71,6 +83,8 @@ const server = http.createServer(async (req, res) => {
         else { await fs.mkdir(path.join(data, 'uploads'), { recursive: true }); await fs.writeFile(path.join(data, 'uploads', `${id}.pdf`), bytes); }
       }
       const item = { id, title: p.title.trim(), author: p.author.trim(), description: p.description.trim(), category: p.category, url: appURL.href, createdAt: new Date().toISOString(), plan };
+      const salt = randomBytes(16).toString('hex');
+      item.deleteAuth = { salt, hash: await passwordHash(p.password, salt) };
       try { await save(item); }
       catch (error) {
         if (plan) {
@@ -81,7 +95,46 @@ const server = http.createServer(async (req, res) => {
         }
         throw error;
       }
-      return json(201, item);
+      return json(201, publicProject(item));
+    }
+    if (req.method === 'DELETE' && /^\/api\/projects\/[a-f0-9-]{36}$/.test(url.pathname)) {
+      const id = url.pathname.split('/').pop();
+      const item = (await projects()).find(p => p.id === id);
+      if (!item) return json(404, { error: '이미 삭제되었거나 존재하지 않는 작품입니다.' });
+      let size = 0; const chunks = [];
+      for await (const chunk of req) { size += chunk.length; if (size > 1024) return json(413, { error: '요청이 너무 큽니다.' }); chunks.push(chunk); }
+      let password; try { password = JSON.parse(Buffer.concat(chunks).toString())?.password; } catch { return json(400, { error: '암호를 입력해주세요.' }); }
+      if (typeof password !== 'string' || !/^\d{4}$/.test(password)) return json(400, { error: '숫자 4자리 암호를 입력해주세요.' });
+      const now = Date.now();
+      for (const [key, value] of attempts) if (value.until <= now) attempts.delete(key);
+      const failures = attempts.get(id);
+      if (failures?.count >= 5) {
+        res.setHeader('Retry-After', Math.ceil((failures.until - now) / 1000));
+        return json(429, { error: '암호를 5회 잘못 입력했습니다. 15분 후 다시 시도해주세요.' });
+      }
+      const master = timingSafeEqual(await derive(password, masterSalt, 32), masterHash);
+      const owner = item.deleteAuth && await matches(password, item.deleteAuth.salt, item.deleteAuth.hash);
+      if (!master && !owner) {
+        attempts.set(id, { count: (failures?.count || 0) + 1, until: failures?.until || now + 15 * 60 * 1000 });
+        return json(403, { error: '암호가 일치하지 않습니다. 이전에 등록한 작품은 관리자 암호로 삭제할 수 있습니다.' });
+      }
+      if (cloud) await remote(`/rest/v1/showcase_projects?id=eq.${id}`, { method: 'DELETE' });
+      else {
+        const operation = queue.then(async () => {
+          const list = (await projects()).filter(p => p.id !== id);
+          await fs.writeFile(path.join(data, 'projects.tmp'), JSON.stringify(list));
+          await fs.rename(path.join(data, 'projects.tmp'), path.join(data, 'projects.json'));
+        });
+        queue = operation.catch(() => {}); await operation;
+      }
+      attempts.delete(id);
+      if (item.plan) {
+        try {
+          if (cloud) await remote(`/storage/v1/object/${bucket}/${id}.pdf`, { method: 'DELETE' });
+          else await fs.unlink(path.join(data, 'uploads', `${id}.pdf`));
+        } catch { console.error('삭제된 작품의 PDF 정리가 필요합니다:', id); }
+      }
+      return json(200, { deleted: true });
     }
     if (req.method === 'GET' && /^\/plans\/[a-f0-9-]{36}\.pdf$/.test(url.pathname)) {
       const item = (await projects()).find(p => p.plan?.href === url.pathname);
